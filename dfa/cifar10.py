@@ -65,7 +65,7 @@ NUM_EXAMPLES_PER_EPOCH_FOR_EVAL = cifar10_input.NUM_EXAMPLES_PER_EPOCH_FOR_EVAL
 
 # Constants describing the training process.
 MOVING_AVERAGE_DECAY = 0.9999     # The decay to use for the moving average.
-INITIAL_LEARNING_RATE = 0.0001       # Initial learning rate.
+INITIAL_LEARNING_RATE = 0.01       # Initial learning rate.
 
 # If a model is trained with multiple GPUs, prefix all Op names with tower_name
 # to differentiate the operations. Note that this prefix is removed from the
@@ -206,10 +206,10 @@ def inference(images, training=False):
   with tf.variable_scope('conv1') as scope:
     kernel = _variable_with_weight_decay('weights',
                                          shape=[5, 5, 3, 96],
-                                         stddev=5e-2,
+                                         stddev=0.0,
                                          wd=None)
     conv = tf.nn.conv2d(drop_input, kernel, [1, 1, 1, 1], padding='SAME')
-    biases = _variable_on_cpu('biases', [96], tf.constant_initializer(0.0))
+    biases = _variable_on_cpu('biases', [96], tf.zeros_initializer())
     pre_activation = tf.nn.bias_add(conv, biases)
     conv1 = tf.nn.tanh(pre_activation, name=scope.name)
     _activation_summary(conv1)
@@ -223,10 +223,10 @@ def inference(images, training=False):
   with tf.variable_scope('conv2') as scope:
     kernel = _variable_with_weight_decay('weights',
                                          shape=[5, 5, 96, 128],
-                                         stddev=5e-2,
+                                         stddev=0.0,
                                          wd=None)
     conv = tf.nn.conv2d(drop_pool1, kernel, [1, 1, 1, 1], padding='SAME')
-    biases = _variable_on_cpu('biases', [128], tf.constant_initializer(0.1))
+    biases = _variable_on_cpu('biases', [128], tf.zeros_initializer())
     pre_activation = tf.nn.bias_add(conv, biases)
     conv2 = tf.nn.tanh(pre_activation, name=scope.name)
     _activation_summary(conv2)
@@ -240,10 +240,10 @@ def inference(images, training=False):
   with tf.variable_scope('conv3') as scope:
     kernel = _variable_with_weight_decay('weights',
                                          shape=[5, 5, 128, 256],
-                                         stddev=5e-2,
+                                         stddev=0.0,
                                          wd=None)
     conv = tf.nn.conv2d(drop_pool2, kernel, [1, 1, 1, 1], padding='SAME')
-    biases = _variable_on_cpu('biases', [256], tf.constant_initializer(0.1))
+    biases = _variable_on_cpu('biases', [256], tf.zeros_initializer())
     pre_activation = tf.nn.bias_add(conv, biases)
     conv3 = tf.nn.tanh(pre_activation, name=scope.name)
     _activation_summary(conv3)
@@ -260,17 +260,17 @@ def inference(images, training=False):
     reshape = tf.reshape(drop_pool3, [FLAGS.batch_size, -1])
     dim = reshape.get_shape()[1].value
     weights = _variable_with_weight_decay('weights', shape=[dim, 2048],
-                                          stddev=0.04, wd=None)
-    biases = _variable_on_cpu('biases', [2048], tf.constant_initializer(0.1))
+                                          stddev=0.0, wd=None)
+    biases = _variable_on_cpu('biases', [2048], tf.zeros_initializer())
     dense4 = tf.nn.tanh(tf.matmul(reshape, weights) + biases, name=scope.name)
     drop_dense4 = tf.layers.dropout(inputs=dense4, rate=0.5, training=training)
     _activation_summary(dense4)
 
-  # dense4
+  # dense5
   with tf.variable_scope('dense5') as scope:
     weights = _variable_with_weight_decay('weights', shape=[2048, 2048],
-                                          stddev=0.04, wd=None)
-    biases = _variable_on_cpu('biases', [2048], tf.constant_initializer(0.1))
+                                          stddev=0.0, wd=None)
+    biases = _variable_on_cpu('biases', [2048], tf.zeros_initializer())
     dense5 = tf.nn.tanh(tf.matmul(drop_dense4, weights) + biases, name=scope.name)
     drop_dense5 = tf.layers.dropout(inputs=dense5, rate=0.5, training=training)
     _activation_summary(dense5)
@@ -283,11 +283,12 @@ def inference(images, training=False):
     weights = _variable_with_weight_decay('weights', [2048, NUM_CLASSES],
                                           stddev=1/2048.0, wd=None)
     biases = _variable_on_cpu('biases', [NUM_CLASSES],
-                              tf.constant_initializer(0.0))
+                              tf.zeros_initializer())
     softmax_linear = tf.add(tf.matmul(drop_dense5, weights), biases, name=scope.name)
-    _activation_summary(softmax_linear)
+    softmax = tf.nn.softmax(softmax_linear)
+    _activation_summary(softmax)
 
-  return softmax_linear
+  return softmax
 
 
 def loss(logits, labels):
@@ -303,14 +304,15 @@ def loss(logits, labels):
     Loss tensor of type float.
   """
   # Calculate the average cross entropy loss across the batch.
-  labels = tf.cast(labels, tf.int64)
-  cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
-      labels=labels, logits=logits, name='cross_entropy_per_example')
-  cross_entropy_mean = tf.reduce_mean(cross_entropy, name='cross_entropy')
+  ohl = onehot_labels = tf.one_hot(indices=tf.cast(labels, tf.int64), depth=10)
+  cross_entropy = tf.losses.softmax_cross_entropy(
+      onehot_labels=ohl, logits=logits)
+  cross_entropy_mean = tf.reduce_mean(cross_entropy)
+  tf.add_to_collection('losses', cross_entropy_mean)
 
   # The total loss is defined as the cross entropy loss plus all of the weight
   # decay terms (L2 loss).
-  return cross_entropy_mean
+  return cross_entropy
 
 
 def _add_loss_summaries(total_loss):
@@ -361,13 +363,17 @@ def train(total_loss, global_step):
   tf.summary.scalar('learning_rate', lr)
 
   # Generate moving averages of all losses and associated summaries.
-  loss_averages_op = _add_loss_summaries(total_loss)
+  #loss_averages_op = _add_loss_summaries(total_loss)
 
   # Compute gradients.
-  with tf.control_dependencies([loss_averages_op]):
-    opt = dfa.DFA(lr) # Direct Feedback Alignment optimizer
-    grads = opt.compute_gradients(total_loss) # Call custom compute_gradients method
-    maxnorm = [(tf.clip_by_norm(grad, 4), var) for grad, var in grads]
+  #with tf.control_dependencies([loss_averages_op]):
+  losses = tf.get_collection('losses')
+  for l in losses + [tf.reduce_mean(total_loss)]:
+    tf.summary.scalar(l.op.name+"_raw", l)
+  opt = dfa.DFA(lr) # Direct Feedback Alignment optimizer
+  grads = opt.compute_gradients(total_loss) # Call custom compute_gradients method
+
+  maxnorm = [(tf.clip_by_norm(grad, 4), var) for grad, var in grads]
 
   # Apply gradients.
   apply_gradient_op = opt.apply_gradients(maxnorm, global_step=global_step) # Used _apply_dense function from tensorflow's stochastic gradient descent, see dfa.py

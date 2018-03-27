@@ -56,17 +56,28 @@ class DFA(optimizer.Optimizer): # A lot copy-pasted from the optimizer base clas
         # pylint: disable=protected-access
         var_list += ops.get_collection(ops.GraphKeys._STREAMING_MODEL_PORTS)
         # pylint: enable=protected-access
+        processors = [optimizer._get_processor(v) for v in var_list]
         if not var_list:
           raise ValueError("No variables to optimize.")
-        B = [] # so it's in the right scope
+        var_refs = [p.target() for p in processors]
         if(self._B == []): # if it hasn't been initialized
             stddev = math_ops.cast(self._stddev_t, tf.float32)
-            for v in var_list: # iterate through layers and give B the same shape
-                B.append(tf.random_uniform(v.get_shape(), minval=-1*stddev, maxval=stddev, dtype=tf.float32)) # random matrix, uniform distribution between [-stddev, stddev]
-            self._B = B
-        else:
-            B = self._B
-        grads = [tf.multiply(loss, B[i]) for i in range(0,len(var_list))] # matmul didn't work but I guess this does
+            for v in var_refs: # iterate through layers and give B the same shape
+                shape = [10]+v.get_shape().as_list()
+                shape.reverse()
+                self._B.append(tf.Variable(tf.random_uniform(shape, minval=tf.multiply(-1., stddev), maxval=stddev), trainable=False)) # random matrix, uniform distribution between [-stddev, stddev]
+        grads = [tf.multiply(tf.reduce_sum(tf.transpose(tf.multiply(loss, self._B[i])),axis=0),
+                             tf.subtract(1., tf.square(tf.tanh(var_list[i].op.outputs[0]))))
+                 for i in range(0,len(var_list)-2)] # matmul didn't work but I guess this does
+        grads.append(tf.gradients(loss, var_refs[-2],
+                                  grad_ys=grad_loss,
+                                  gate_gradients=(gate_gradients == optimizer.Optimizer.GATE_OP),
+                                  aggregation_method=aggregation_method,
+                                  colocate_gradients_with_ops=colocate_gradients_with_ops)[0])
+        grads.append(tf.gradients(loss, var_refs[-1],
+                                  gate_gradients=(gate_gradients == optimizer.Optimizer.GATE_OP),
+                                  aggregation_method=aggregation_method,
+                                  colocate_gradients_with_ops=colocate_gradients_with_ops)[0]) # Get the gradients for the final layer as tensorflow does normally(?)
         
         if gate_gradients == optimizer.Optimizer.GATE_GRAPH:
           grads = control_flow_ops.tuple(grads)
