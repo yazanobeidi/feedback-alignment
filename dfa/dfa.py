@@ -16,8 +16,8 @@ class DFA(optimizer.Optimizer): # A lot copy-pasted from the optimizer base clas
     def __init__(self, learning_rate=0.001, stddev=0.5, use_locking=False, name="DFA"):
         super(DFA, self).__init__(use_locking, name)
         self._lr = learning_rate
-        self._stddev = stddev # not really because it's a uniform distribution, [-0.5, 0.5] was the value lillicrap used
-        self._B = [] # Build this the first time compute_gradients is called so the shape of each layer can be used
+        self._stddev = stddev
+        self._B = []
 
         self._lr_t = ops.convert_to_tensor(self._lr, name="learning_rate") # Normally these are in _prepare but it seems that doesn't get called before compute_gradients for this implementation?
         self._stddev_t = ops.convert_to_tensor(self._stddev, name="standard_deviation")
@@ -60,15 +60,21 @@ class DFA(optimizer.Optimizer): # A lot copy-pasted from the optimizer base clas
         if not var_list:
           raise ValueError("No variables to optimize.")
         var_refs = [p.target() for p in processors]
-        if(self._B == []): # if it hasn't been initialized
+        act_refs = []
+        if(self._B == []):
             stddev = math_ops.cast(self._stddev_t, tf.float32)
-            for v in var_refs: # iterate through layers and give B the same shape
+            for v in var_refs:
                 shape = [10]+v.get_shape().as_list()
                 shape.reverse()
-                self._B.append(tf.Variable(tf.random_uniform(shape, minval=tf.multiply(-1., stddev), maxval=stddev), trainable=False)) # random matrix, uniform distribution between [-stddev, stddev]
-        grads = [tf.multiply(tf.reduce_sum(tf.transpose(tf.multiply(loss, self._B[i])),axis=0),
-                             tf.subtract(1., tf.square(tf.tanh(var_list[i].op.outputs[0]))))
-                 for i in range(0,len(var_list)-2)] # matmul didn't work but I guess this does
+                if(self._stddev == 0):
+                    stddev = tf.rsqrt(math_ops.cast(v.shape[-1], tf.float32))
+                self._B.append(tf.Variable(tf.random_uniform(shape, minval=tf.multiply(-1., stddev), maxval=stddev), trainable=False, name=v.op.name+'/B')) # random matrix, uniform distribution between [-stddev, stddev]
+                act_name = "/".join(v.op.name.split("/")[:-1])+"/activations"
+                act_refs.append(tf.get_default_graph().get_operation_by_name(act_name).outputs[0])
+        f_grad = tf.reduce_mean(tf.gradients(loss, act_refs[-1])[0], axis=0)
+        grads = [tf.multiply(tf.reduce_sum(tf.transpose(tf.multiply(f_grad, self._B[i])),axis=0),
+                             tf.gradients(act_refs[i], var_refs[i], grad_ys=grad_loss, gate_gradients=(gate_gradients == optimizer.Optimizer.GATE_OP), aggregation_method=aggregation_method, colocate_gradients_with_ops=colocate_gradients_with_ops)[0])
+                 for i in range(0,len(var_refs)-2)]
         grads.append(tf.gradients(loss, var_refs[-2],
                                   grad_ys=grad_loss,
                                   gate_gradients=(gate_gradients == optimizer.Optimizer.GATE_OP),
@@ -78,7 +84,6 @@ class DFA(optimizer.Optimizer): # A lot copy-pasted from the optimizer base clas
                                   gate_gradients=(gate_gradients == optimizer.Optimizer.GATE_OP),
                                   aggregation_method=aggregation_method,
                                   colocate_gradients_with_ops=colocate_gradients_with_ops)[0]) # Get the gradients for the final layer as tensorflow does normally(?)
-        
         if gate_gradients == optimizer.Optimizer.GATE_GRAPH:
           grads = control_flow_ops.tuple(grads)
         grads_and_vars = list(zip(grads, var_list))
@@ -87,7 +92,7 @@ class DFA(optimizer.Optimizer): # A lot copy-pasted from the optimizer base clas
              if g is not None and v.dtype != dtypes.resource])
         return grads_and_vars
 
-    def _apply_dense(self, grad, var): # literally(ish) copy-pasted from tensorflow's stochastic gradient descent implementation, which is mostly hooks to C++, should deal with derivatives for us. Can swap this for something like RMSProp, Adam, etc pretty easily too.
+    def _apply_dense(self, grad, var):
         return training_ops.apply_gradient_descent(
             var,
             math_ops.cast(self._lr_t, var.dtype.base_dtype),
